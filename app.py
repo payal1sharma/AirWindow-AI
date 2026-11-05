@@ -1,21 +1,24 @@
 
+
 from flask import Flask, render_template, request
 from dotenv import load_dotenv
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import requests
+import math
 import os
 
 app = Flask(__name__)
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
+
 API_KEY = os.getenv("OPENAQ_API_KEY")
 
 
-# 1. Find city coordinates
-def get_city(city):
+# 1. Find the selected city
+def find_city(city):
 
     url = "https://geocoding-api.open-meteo.com/v1/search"
 
@@ -32,16 +35,33 @@ def get_city(city):
     results = response.json().get("results", [])
 
     if not results:
-        raise ValueError("City not found. Try another city name.")
+        raise ValueError("City not found. Enter city and state.")
 
     return results[0]
 
 
-# 2. Find nearest OpenAQ monitoring station
-def get_nearest_station(latitude, longitude):
+# 2. Calculate distance between two locations
+def calculate_distance(lat1, lon1, lat2, lon2):
 
-    if not API_KEY:
-        raise ValueError("OpenAQ API key missing in .env")
+    radius = 6371
+
+    lat1 = math.radians(lat1)
+    lat2 = math.radians(lat2)
+
+    dlat = lat2 - lat1
+    dlon = math.radians(lon2 - lon1)
+
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2)
+        * math.sin(dlon / 2) ** 2
+    )
+
+    return radius * 2 * math.asin(math.sqrt(a))
+
+
+# 3. Find the nearest monitoring station
+def find_station(latitude, longitude):
 
     url = "https://api.openaq.org/v3/locations"
 
@@ -56,76 +76,109 @@ def get_nearest_station(latitude, longitude):
     response = requests.get(
         url, params=params, headers=headers, timeout=20
     )
+
     response.raise_for_status()
 
     locations = response.json().get("results", [])
 
-    suitable = []
+    candidates = []
 
     for location in locations:
 
         sensors = location.get("sensors", [])
 
-        for sensor in sensors:
+        has_pm25 = any(
+            sensor.get("parameter", {}).get("name", "")
+            .lower().replace(".", "").replace("_", "") == "pm25"
+            for sensor in sensors
+        )
+
+        if has_pm25:
+            coordinates = location.get("coordinates") or {}
+
+            station_lat = coordinates.get("latitude")
+            station_lon = coordinates.get("longitude")
+
+            if station_lat is None or station_lon is None:
+                continue
+
+            distance = calculate_distance(
+                latitude, longitude, station_lat, station_lon
+            )
+
+            candidates.append((distance, location))
+
+    candidates.sort(key=lambda x: x[0])
+
+    # Check nearby stations until recent sensor values are found
+    for distance, location in candidates[:10]:
+
+        url = (
+            f"https://api.openaq.org/v3/locations/"
+            f"{location['id']}/sensors"
+        )
+
+        response = requests.get(
+            url, headers=headers, timeout=20
+        )
+
+        response.raise_for_status()
+
+        readings = {}
+
+        for sensor in response.json().get("results", []):
 
             name = sensor.get("parameter", {}).get("name", "")
-            name = name.lower().replace(".", "")
+            name = name.lower().replace(".", "").replace("_", "")
 
-            if name == "pm25":
-                suitable.append(location)
-                break
+            latest = sensor.get("latest") or {}
 
-    if not suitable:
-        return None
+            value = latest.get("value")
+            time = (latest.get("datetime") or {}).get("utc")
 
-    suitable.sort(
-        key=lambda x: x.get("distance")
-        if x.get("distance") is not None else 999999
-    )
+            if name not in ["pm25", "pm10"]:
+                continue
 
-    return suitable[0]
+            if value is None or not time:
+                continue
 
+            if name not in readings or time > readings[name]["time"]:
+                readings[name] = {
+                    "value": value,
+                    "time": time
+                }
 
-# 3. Fetch live pollution readings
-def get_live_data(station_id):
+        # Do not call the station current if its PM2.5 is stale
+        pm25 = readings.get("pm25")
 
-    url = f"https://api.openaq.org/v3/locations/{station_id}/sensors"
+        if pm25:
+            measured_at = datetime.fromisoformat(
+                pm25["time"].replace("Z", "+00:00")
+            )
 
-    headers = {"X-API-Key": API_KEY}
+            age = datetime.now(timezone.utc) - measured_at
 
-    response = requests.get(url, headers=headers, timeout=20)
-    response.raise_for_status()
+            if age <= timedelta(hours=48):
+                return location, distance, readings
 
-    readings = {}
-
-    for sensor in response.json().get("results", []):
-
-        name = sensor.get("parameter", {}).get("name", "")
-        name = name.lower().replace(".", "")
-
-        latest = sensor.get("latest") or {}
-
-        value = latest.get("value")
-        time = (latest.get("datetime") or {}).get("utc")
-
-        if name not in ["pm25", "pm10"]:
-            continue
-
-        if value is None or time is None:
-            continue
-
-        if name not in readings or time > readings[name]["time"]:
-
-            readings[name] = {
-                "value": value,
-                "time": time
-            }
-
-    return readings
+    return None, None, {}
 
 
-# 4. Get pollution forecast and best time
-def get_forecast(latitude, longitude, timezone, duration):
+# 4. Convert measurement time into local time
+def format_time(value, timezone):
+
+    if not value:
+        return "Unavailable"
+
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+    return dt.astimezone(
+        ZoneInfo(timezone)
+    ).strftime("%d %b %Y, %I:%M %p")
+
+
+# 5. Get forecast for four time periods
+def get_forecast(latitude, longitude, timezone):
 
     url = "https://air-quality-api.open-meteo.com/v1/air-quality"
 
@@ -144,89 +197,69 @@ def get_forecast(latitude, longitude, timezone, duration):
 
     now = datetime.now(ZoneInfo(timezone)).replace(tzinfo=None)
 
-    options = []
+    periods = {
+        "Morning": [],
+        "Day": [],
+        "Evening": [],
+        "Night": []
+    }
 
-    for i, time in enumerate(hourly["time"]):
+    for i in range(len(hourly["time"])):
 
-        forecast_time = datetime.fromisoformat(time)
+        time = datetime.fromisoformat(hourly["time"][i])
 
         pm25 = hourly["pm2_5"][i]
         pm10 = hourly["pm10"][i]
 
-        if forecast_time >= now and pm25 is not None:
-
-            options.append({
-                "time": forecast_time,
-                "pm25": pm25,
-                "pm10": pm10
-            })
-
-    if len(options) < duration:
-        raise ValueError("Not enough forecast data available.")
-
-    windows = []
-
-    for i in range(len(options) - duration + 1):
-
-        window = options[i:i + duration]
-
-        # Check consecutive hours
-        consecutive = all(
-            window[j]["time"] - window[j - 1]["time"]
-            == timedelta(hours=1)
-            for j in range(1, duration)
-        )
-
-        if not consecutive:
+        if time < now or pm25 is None:
             continue
 
-        avg25 = sum(x["pm25"] for x in window) / duration
+        hour = time.hour
 
-        pm10_values = [
-            x["pm10"] for x in window if x["pm10"] is not None
-        ]
+        if 5 <= hour < 11:
+            period = "Morning"
 
-        avg10 = (
-            sum(pm10_values) / len(pm10_values)
-            if pm10_values else None
-        )
+        elif 11 <= hour < 16:
+            period = "Day"
 
-        windows.append({
-            "start": window[0]["time"],
-            "end": window[0]["time"] + timedelta(hours=duration),
-            "pm25": avg25,
-            "pm10": avg10
+        elif 16 <= hour < 20:
+            period = "Evening"
+
+        else:
+            period = "Night"
+
+        periods[period].append({
+            "time": time,
+            "pm25": pm25,
+            "pm10": pm10
         })
 
-    if not windows:
-        raise ValueError("No complete forecast window available.")
+    results = []
 
-    lowest = min(x["pm25"] for x in windows)
-    highest = max(x["pm25"] for x in windows)
+    for name, values in periods.items():
 
-    for item in windows:
+        if values:
 
-        if highest == lowest:
-            item["score"] = 100
+            best = min(values, key=lambda x: x["pm25"])
+
+            results.append({
+                "name": name,
+                "time": best["time"].strftime("%d %b %Y, %I:%M %p"),
+                "pm25": round(best["pm25"], 2),
+                "pm10": round(best["pm10"], 2)
+                if best["pm10"] is not None else "Unavailable"
+            })
+
         else:
-            item["score"] = round(
-                100 * (highest - item["pm25"]) / (highest - lowest)
-            )
 
-    return min(windows, key=lambda x: x["pm25"])
+            results.append({
+                "name": name,
+                "time": "Unavailable",
+                "pm25": "Unavailable",
+                "pm10": "Unavailable"
+            })
 
-
-# 5. Display measurement time in city timezone
-def format_time(value, timezone):
-
-    if not value:
-        return "Unavailable"
-
-    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-    return dt.astimezone(
-        ZoneInfo(timezone)
-    ).strftime("%d %b %Y, %I:%M %p")
+    return results
 
 
 # 6. Main website
@@ -234,38 +267,29 @@ def format_time(value, timezone):
 def home():
 
     city = request.args.get("city", "Jaipur, Rajasthan").strip()
-    activity = request.args.get("activity", "Walking")
-    duration = request.args.get("duration", 1, type=int)
-
-    if activity not in ["Walking", "Running", "Cycling"]:
-        activity = "Walking"
-
-    if duration not in [1, 2, 3]:
-        duration = 1
 
     try:
 
-        place = get_city(city)
+        place = find_city(city)
 
         latitude = place["latitude"]
         longitude = place["longitude"]
-        timezone = place.get("timezone") or "Asia/Kolkata"
+        timezone = place["timezone"]
 
-        station = get_nearest_station(latitude, longitude)
-
-        readings = (
-            get_live_data(station["id"])
-            if station else {}
+        station, distance, readings = find_station(
+            latitude, longitude
         )
 
-        best = get_forecast(
-            latitude, longitude, timezone, duration
+        periods = get_forecast(
+            latitude, longitude, timezone
         )
 
         data = {
             "city": place["name"],
             "state": place.get("admin1", ""),
-            "station": station["name"] if station else "No station within 25 km",
+            "country": place.get("country", ""),
+            "station": station["name"] if station else "Not available",
+            "distance": round(distance, 1) if distance is not None else None,
 
             "pm25": readings.get("pm25", {}).get("value", "Unavailable"),
             "pm10": readings.get("pm10", {}).get("value", "Unavailable"),
@@ -277,22 +301,13 @@ def home():
                 readings.get("pm10", {}).get("time"), timezone
             ),
 
-            "activity": activity,
-            "duration": duration,
-
-            "best_time": best["start"].strftime("%d %b, %I:%M %p"),
-            "end_time": best["end"].strftime("%I:%M %p"),
-            "best_pm25": round(best["pm25"], 2),
-            "best_pm10": round(best["pm10"], 2)
-            if best["pm10"] is not None else "Unavailable"
+            "periods": periods
         }
 
         return render_template(
             "index.html",
             data=data,
             city=city,
-            activity=activity,
-            duration=duration,
             error=None
         )
 
@@ -302,8 +317,6 @@ def home():
             "index.html",
             data=None,
             city=city,
-            activity=activity,
-            duration=duration,
             error=str(error)
         )
 
