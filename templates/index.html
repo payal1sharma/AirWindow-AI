@@ -1,0 +1,182 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AirWindow AI</title>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f1f5f9;
+            text-align: center;
+            padding: 25px;
+            color: #1e293b;
+        }
+
+        .container {
+            max-width: 750px;
+            margin: auto;
+        }
+
+        h1 {
+            color: #0f766e;
+        }
+
+        .card {
+            background: white;
+            padding: 25px;
+            margin: 20px 0;
+            border-radius: 12px;
+        }
+
+        input, select, button {
+            padding: 12px;
+            margin: 8px;
+            border: 1px solid #cbd5e1;
+            border-radius: 6px;
+            font-size: 15px;
+        }
+
+        button {
+            background: #0f766e;
+            color: white;
+            cursor: pointer;
+        }
+
+        .value {
+            font-size: 28px;
+            color: #0f766e;
+            font-weight: bold;
+        }
+
+        .recommendation {
+            background: #dcfce7;
+            padding: 20px;
+            border-radius: 10px;
+        }
+
+        .note {
+            color: #64748b;
+            font-size: 13px;
+        }
+
+        .error {
+            color: #b91c1c;
+            background: #fee2e2;
+            padding: 15px;
+            border-radius: 8px;
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="container">
+
+    <h1>AirWindow AI</h1>
+
+    <p>Live Air Quality Monitoring & Smart Activity Planner</p>
+
+    <div class="card">
+
+        <h2>Choose Your Location</h2>
+
+        <form action="/" method="GET">
+
+            <input
+                type="text"
+                name="city"
+                value="{{ city }}"
+                placeholder="Enter city, e.g. Kota, Rajasthan"
+                required
+            >
+
+            <br>
+
+            <select name="activity">
+                <option value="Walking" {% if activity == "Walking" %}selected{% endif %}>Walking</option>
+                <option value="Running" {% if activity == "Running" %}selected{% endif %}>Running</option>
+                <option value="Cycling" {% if activity == "Cycling" %}selected{% endif %}>Cycling</option>
+            </select>
+
+            <select name="duration">
+                <option value="1" {% if duration == 1 %}selected{% endif %}>1 Hour</option>
+                <option value="2" {% if duration == 2 %}selected{% endif %}>2 Hours</option>
+                <option value="3" {% if duration == 3 %}selected{% endif %}>3 Hours</option>
+            </select>
+
+            <br>
+
+            <button type="submit">Get Recommendation</button>
+
+        </form>
+
+    </div>
+
+    {% if error %}
+
+        <div class="error">
+            {{ error }}
+        </div>
+
+    {% endif %}
+
+    {% if data %}
+
+        <div class="card">
+
+            <h2>Current Air Quality</h2>
+
+            <h3>{{ data.city }}, {{ data.state }}</h3>
+
+            <p>Monitoring station: {{ data.station }}</p>
+
+            <h3>PM2.5</h3>
+            <div class="value">{{ data.pm25 }} µg/m³</div>
+            <p>{{ data.time25 }}</p>
+
+            <hr>
+
+            <h3>PM10</h3>
+            <div class="value">{{ data.pm10 }} µg/m³</div>
+            <p>{{ data.time10 }}</p>
+
+        </div>
+
+        <div class="card">
+
+            <h2>Smart Activity Recommendation</h2>
+
+            <div class="recommendation">
+
+                <h3>Best time for {{ data.activity }}</h3>
+
+                <div class="value">
+                    {{ data.best_time }} - {{ data.end_time }}
+                </div>
+
+                <p>Duration: {{ data.duration }} hour(s)</p>
+
+                <p>Predicted PM2.5: {{ data.best_pm25 }} µg/m³</p>
+
+                <p>Predicted PM10: {{ data.best_pm10 }} µg/m³</p>
+
+            </div>
+
+        </div>
+
+    {% endif %}
+
+    <p class="note">
+        Sources: OpenAQ and Open-Meteo.
+    </p>
+
+    <p class="note">
+        The score compares available forecast windows.
+        It is not a probability of safety or medical advice.
+    </p>
+
+</div>
+
+</body>
+</html>
